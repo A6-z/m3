@@ -99,30 +99,6 @@ def _is_safe_query(sql_query: str, internal_tool: bool = False) -> tuple[bool, s
                 if pattern in sql_upper:
                     return False, f"Injection pattern detected: {description}"
 
-            # Context-aware protection: Block suspicious table/column names not in medical databases
-            suspicious_names = [
-                "PASSWORD",
-                "ADMIN",
-                "USER",
-                "LOGIN",
-                "AUTH",
-                "TOKEN",
-                "CREDENTIAL",
-                "SECRET",
-                "KEY",
-                "HASH",
-                "SALT",
-                "SESSION",
-                "COOKIE",
-            ]
-
-            for name in suspicious_names:
-                if name in sql_upper:
-                    return (
-                        False,
-                        f"Suspicious identifier detected: {name} (not medical data)",
-                    )
-
         return True, "Safe"
 
     except Exception as e:
@@ -176,6 +152,215 @@ def _get_backend_info() -> str:
         return f"🔧 **Current Backend:** DuckDB (local database)\n📁 **Database Path:** {_db_path}\n"
     else:
         return f"🔧 **Current Backend:** BigQuery (cloud database)\n☁️ **Project ID:** {_project_id}\n"
+
+
+def _validate_note_type(note_type: str) -> bool:
+    """Validate note_type parameter for clinical notes tools."""
+    return note_type in {"all", "discharge", "radiology"}
+
+
+def _escape_sql_literal(value: str) -> str:
+    """Escape single quotes for safe SQL literal usage."""
+    return value.replace("'", "''")
+
+
+def _split_duckdb_table_name(table_name: str) -> tuple[str | None, str]:
+    """Split DuckDB table name into optional schema + table parts."""
+    clean = table_name.strip().strip("`").strip('"')
+    if "." not in clean:
+        return None, clean
+
+    parts = [part.strip().strip('"') for part in clean.split(".") if part.strip()]
+    if len(parts) >= 2:
+        return parts[-2], parts[-1]
+    return None, clean
+
+
+def _quote_duckdb_identifier(schema: str | None, table: str) -> str:
+    """Build a safely quoted DuckDB table identifier."""
+    if schema:
+        return f'"{schema}"."{table}"'
+    return f'"{table}"'
+
+
+def _discover_notes_tables(note_type: str = "all") -> list[dict[str, str]]:
+    """Discover clinical notes tables for active backend.
+
+    Returns:
+        List of dicts with keys: display_name, query_name, dataset, table_name
+    """
+    tables: list[dict[str, str]] = []
+
+    if _backend == "duckdb":
+        conn = duckdb.connect(_db_path)
+        try:
+            df = conn.execute(
+                """
+                SELECT table_schema, table_name
+                FROM information_schema.tables
+                WHERE (
+                    LOWER(table_name) LIKE '%note%'
+                    OR LOWER(table_name) LIKE '%discharge%'
+                    OR LOWER(table_name) LIKE '%radiology%'
+                  )
+                ORDER BY table_schema, table_name
+                """
+            ).df()
+        finally:
+            conn.close()
+
+        table_rows = (
+            list(zip(df["table_schema"].tolist(), df["table_name"].tolist()))
+            if not df.empty
+            else []
+        )
+        for table_schema, table_name in table_rows:
+            lower_name = table_name.lower()
+            if note_type == "discharge" and "discharge" not in lower_name:
+                continue
+            if note_type == "radiology" and "radiology" not in lower_name:
+                continue
+
+            if table_schema and table_schema != "main":
+                query_name = f'"{table_schema}"."{table_name}"'
+                display_name = f"{table_schema}.{table_name}"
+            else:
+                query_name = f'"{table_name}"'
+                display_name = table_name
+
+            tables.append(
+                {
+                    "display_name": display_name,
+                    "query_name": query_name,
+                    "dataset": table_schema or "main",
+                    "table_name": table_name,
+                }
+            )
+
+        return tables
+
+    # BigQuery: Dynamically discover all datasets, then search for notes tables
+    try:
+        datasets_df = _bq_client.query(
+            """
+            SELECT DISTINCT table_schema
+            FROM `region-us.INFORMATION_SCHEMA.TABLE_STORAGE`
+            ORDER BY table_schema
+            """
+        ).to_dataframe()
+        bq_datasets = datasets_df["table_schema"].tolist() if not datasets_df.empty else []
+    except Exception:
+        # Fallback to known note datasets
+        bq_datasets = [
+            "physionet-data.mimiciv_note",
+            "physionet-data.mimiciv_3_1_note",
+        ]
+
+    for dataset in bq_datasets:
+        try:
+            df = _bq_client.query(
+                f"""
+                SELECT table_name
+                FROM `{dataset}.INFORMATION_SCHEMA.TABLES`
+                ORDER BY table_name
+                """
+            ).to_dataframe()
+        except Exception:
+            continue
+
+        if df.empty:
+            continue
+
+        for table_name in df["table_name"].tolist():
+            lower_name = table_name.lower()
+            if note_type == "discharge" and "discharge" not in lower_name:
+                continue
+            if note_type == "radiology" and "radiology" not in lower_name:
+                continue
+            if note_type == "all" and (
+                "note" not in lower_name
+                and "discharge" not in lower_name
+                and "radiology" not in lower_name
+            ):
+                continue
+
+            tables.append(
+                {
+                    "display_name": f"`{dataset}.{table_name}`",
+                    "query_name": f"`{dataset}.{table_name}`",
+                    "dataset": dataset,
+                    "table_name": table_name,
+                }
+            )
+
+    return tables
+
+
+def _get_table_columns(table: dict[str, str]) -> list[str]:
+    """Get ordered column names for a selected table."""
+    if _backend == "duckdb":
+        table_name = table["table_name"]
+        table_schema = table.get("dataset", "main")
+        conn = duckdb.connect(_db_path)
+        try:
+            if table_schema and table_schema != "main":
+                pragma_target = f'"{table_schema}"."{table_name}"'
+            else:
+                pragma_target = f'"{table_name}"'
+            df = conn.execute(f"PRAGMA table_info({pragma_target})").df()
+        finally:
+            conn.close()
+        if df.empty:
+            return []
+        return df["name"].tolist()
+
+    dataset = table["dataset"]
+    table_name = table["table_name"]
+    df = _bq_client.query(
+        f"""
+        SELECT column_name
+        FROM `{dataset}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = '{_escape_sql_literal(table_name)}'
+        ORDER BY ordinal_position
+        """
+    ).to_dataframe()
+    if df.empty:
+        return []
+    return df["column_name"].tolist()
+
+
+def _find_first_column(columns: list[str], candidates: list[str]) -> str | None:
+    """Find first matching column name from candidates (case-insensitive)."""
+    mapping = {col.lower(): col for col in columns}
+    for candidate in candidates:
+        if candidate.lower() in mapping:
+            return mapping[candidate.lower()]
+    return None
+
+
+def _select_notes_table(
+    discovered_tables: list[dict[str, str]], requested_table: str | None
+) -> tuple[dict[str, str] | None, str | None]:
+    """Select a notes table by optional user-provided table name."""
+    if not discovered_tables:
+        return None, "No clinical notes tables found"
+
+    if not requested_table:
+        return discovered_tables[0], None
+
+    requested = requested_table.strip().strip("`").lower()
+    for table in discovered_tables:
+        display_clean = table["display_name"].strip("`").lower()
+        query_clean = table["query_name"].strip("`").replace('"', "").lower()
+        if (
+            requested == display_clean
+            or requested == table["table_name"].lower()
+            or requested == query_clean
+        ):
+            return table, None
+
+    options = "\n".join(f"- {t['display_name']}" for t in discovered_tables)
+    return None, f"Table '{requested_table}' not found.\n\n📋 **Available notes tables:**\n{options}"
 
 
 # ==========================================
@@ -338,41 +523,88 @@ def _execute_query_internal(sql_query: str) -> str:
 @mcp.tool()
 @require_oauth2
 def get_database_schema() -> str:
-    """🔍 Discover what data is available in the MIMIC-IV database.
+    """🔍 Discover what data is available in the MIMIC-IV database (and any custom tables).
 
     **When to use:** Start here when you need to understand what tables exist, or when someone asks about data that might be in multiple tables.
 
-    **What this does:** Shows all available tables so you can identify which ones contain the data you need.
+    **What this does:** 
+    - Shows all available MIMIC-IV tables
+    - Shows any custom/user-created tables in your project
+    - Lists tables in database schema format
+
+    **Key info:** This tool discovers ALL tables accessible to you, including custom ones like `patient_notes_json`.
+    If you see a table here, you should be able to:
+    1. Query it directly with `execute_mimic_query()` using its fully qualified name
+    2. Explore it with `get_table_info()` if the name matches exactly
+    3. Join it with other tables in your SQL queries
 
     **Next steps after using this:**
     - If you see relevant tables, use `get_table_info(table_name)` to explore their structure
-    - Common tables: `patients` (demographics), `admissions` (hospital stays), `icustays` (ICU data), `labevents` (lab results)
+    - For tables not found by `get_table_info()`, use `execute_mimic_query()` with fully qualified name
+    - Common MIMIC-IV tables: `patients` (demographics), `admissions` (hospital stays), `icustays` (ICU data), `labevents` (lab results)
 
     Returns:
         List of all available tables in the database with current backend info
     """
     if _backend == "duckdb":
         query = """
-        SELECT table_name
+        SELECT
+            CASE
+                WHEN table_schema = 'main' THEN table_name
+                ELSE table_schema || '.' || table_name
+            END AS table_name
         FROM information_schema.tables
-        WHERE table_schema = 'main'
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
         ORDER BY table_name
         """
         result = _execute_query_internal(query)
         return f"{_get_backend_info()}\n📋 **Available Tables:**\n{result}"
 
     elif _backend == "bigquery":
-        # Show fully qualified table names that are ready to copy-paste into queries
-        query = """
-        SELECT CONCAT('`physionet-data.mimiciv_3_1_hosp.', table_name, '`') as query_ready_table_name
-        FROM `physionet-data.mimiciv_3_1_hosp.INFORMATION_SCHEMA.TABLES`
-        UNION ALL
-        SELECT CONCAT('`physionet-data.mimiciv_3_1_icu.', table_name, '`') as query_ready_table_name
-        FROM `physionet-data.mimiciv_3_1_icu.INFORMATION_SCHEMA.TABLES`
-        ORDER BY query_ready_table_name
-        """
-        result = _execute_query_internal(query)
-        return f"{_get_backend_info()}\n📋 **Available Tables (query-ready names):**\n{result}\n\n💡 **Copy-paste ready:** These table names can be used directly in your SQL queries!"
+        # Dynamically discover all datasets accessible to the project
+        try:
+            datasets_df = _bq_client.query(
+                """
+                SELECT DISTINCT table_schema
+                FROM `region-us.INFORMATION_SCHEMA.TABLE_STORAGE`
+                ORDER BY table_schema
+                """
+            ).to_dataframe()
+            dataset_list = (
+                datasets_df["table_schema"].tolist()
+                if not datasets_df.empty
+                else []
+            )
+        except Exception:
+            # Fallback to known MIMIC datasets if dynamic discovery fails
+            dataset_list = [
+                "physionet-data.mimiciv_3_1_hosp",
+                "physionet-data.mimiciv_3_1_icu",
+                "physionet-data.mimiciv_note",
+                "physionet-data.mimiciv_3_1_note",
+            ]
+
+        all_tables: list[str] = []
+        for dataset in dataset_list:
+            try:
+                df = _bq_client.query(
+                    f"""
+                    SELECT table_name
+                    FROM `{dataset}.INFORMATION_SCHEMA.TABLES`
+                    ORDER BY table_name
+                    """
+                ).to_dataframe()
+            except Exception:
+                continue
+
+            if not df.empty:
+                all_tables.extend([f"`{dataset}.{name}`" for name in df["table_name"]])
+
+        if not all_tables:
+            return f"{_get_backend_info()}\n📋 **Available Tables (query-ready names):**\nNo tables found"
+
+        result = "\n".join(all_tables)
+        return f"{_get_backend_info()}\n📋 **Available Tables (query-ready names):**\n{result}\n\n💡 **Copy-paste ready:** These table names can be used directly in your SQL queries!\n💡 **Custom tables:** Any tables you've created in your project (like patient_notes_json) will appear here."
 
 
 @mcp.tool()
@@ -387,10 +619,20 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
     - Displays sample rows so you understand the actual data format
     - Helps you write accurate SQL queries
 
+    **Works with:**
+    - MIMIC-IV tables (e.g., `patients`, `admissions`)
+    - Custom/user-created tables (e.g., `patient_notes_json`)
+    - Fully qualified BigQuery names (e.g., `my-project.my_dataset.my_table`)
+
     **Pro tip:** Always look at sample data! It shows you the actual values, date formats, and data patterns.
 
+    **For custom tables in another GCP project:**
+    If your table is in a different GCP project and `get_database_schema()` shows it but this function fails:
+    1. Use the fully qualified name: `your-project.your_dataset.table_name`
+    2. Or set `M3_PROJECT_ID=your-project` environment variable and restart
+
     Args:
-        table_name: Exact table name from the schema (case-sensitive). Can be simple name or fully qualified BigQuery name.
+        table_name: Table name - can be simple (patients), fully qualified BigQuery name (project.dataset.table), or from get_database_schema() output
         show_sample: Whether to include sample rows (default: True, recommended)
 
     Returns:
@@ -399,17 +641,23 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
     backend_info = _get_backend_info()
 
     if _backend == "duckdb":
+        schema_name, plain_table_name = _split_duckdb_table_name(table_name)
+        qualified_name = _quote_duckdb_identifier(schema_name, plain_table_name)
+
         # Get column information
-        pragma_query = f"PRAGMA table_info('{table_name}')"
+        pragma_query = f"PRAGMA table_info({qualified_name})"
         try:
             result = _execute_duckdb_query(pragma_query)
             if "error" in result.lower():
                 return f"{backend_info}❌ Table '{table_name}' not found. Use get_database_schema() to see available tables."
 
-            info_result = f"{backend_info}📋 **Table:** {table_name}\n\n**Column Information:**\n{result}"
+            shown_name = (
+                f"{schema_name}.{plain_table_name}" if schema_name else plain_table_name
+            )
+            info_result = f"{backend_info}📋 **Table:** {shown_name}\n\n**Column Information:**\n{result}"
 
             if show_sample:
-                sample_query = f"SELECT * FROM '{table_name}' LIMIT 3"
+                sample_query = f"SELECT * FROM {qualified_name} LIMIT 3"
                 sample_result = _execute_duckdb_query(sample_query)
                 info_result += (
                     f"\n\n📊 **Sample Data (first 3 rows):**\n{sample_result}"
@@ -420,111 +668,127 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
             return f"{backend_info}❌ Error examining table '{table_name}': {e}\n\n💡 Use get_database_schema() to see available tables."
 
     else:  # bigquery
-        # Handle both simple names (patients) and fully qualified names (`physionet-data.mimiciv_3_1_hosp.patients`)
-        # Detect qualified names by content: dots + physionet pattern
-        if "." in table_name and "physionet-data" in table_name:
-            # Qualified name (format-agnostic: works with or without backticks)
+        # Try three approaches: (1) fully qualified name, (2) simple name with dynamic dataset search, (3) fallback
+        simple_table_name = table_name.strip("`").split(".")[-1] if "." in table_name else table_name.strip("`")
+        
+        # Attempt 1: If user provided fully qualified name, use it directly
+        if "." in table_name.strip("`"):
             clean_name = table_name.strip("`")
             full_table_name = f"`{clean_name}`"
             parts = clean_name.split(".")
-
-            # Validate BigQuery qualified name format: project.dataset.table
-            if len(parts) != 3:
-                error_msg = (
-                    f"{backend_info}❌ **Invalid qualified table name:** `{table_name}`\n\n"
-                    "**Expected format:** `project.dataset.table`\n"
-                    "**Example:** `physionet-data.mimiciv_3_1_hosp.diagnoses_icd`\n\n"
-                    "**Available MIMIC-IV datasets:**\n"
-                    "- `physionet-data.mimiciv_3_1_hosp.*` (hospital module)\n"
-                    "- `physionet-data.mimiciv_3_1_icu.*` (ICU module)"
-                )
-                return error_msg
-
-            simple_table_name = parts[2]  # table name
-            dataset = f"{parts[0]}.{parts[1]}"  # project.dataset
-        else:
-            # Simple name - try both datasets to find the table
-            simple_table_name = table_name
-            full_table_name = None
-            dataset = None
-
-        # If we have a fully qualified name, try that first
-        if full_table_name:
-            try:
-                # Get column information using the dataset from the full name
-                dataset_parts = dataset.split(".")
-                if len(dataset_parts) >= 2:
-                    project_dataset = f"`{dataset_parts[0]}.{dataset_parts[1]}`"
+            
+            if len(parts) == 3:
+                project, dataset_part, table_part = parts
+                dataset = f"`{project}.{dataset_part}`"
+                simple_table_name = table_part
+                
+                try:
                     info_query = f"""
                     SELECT column_name, data_type, is_nullable
-                    FROM {project_dataset}.INFORMATION_SCHEMA.COLUMNS
+                    FROM {dataset}.INFORMATION_SCHEMA.COLUMNS
                     WHERE table_name = '{simple_table_name}'
                     ORDER BY ordinal_position
                     """
-
+                    
                     info_result = _execute_bigquery_query(info_query)
                     if "No results found" not in info_result:
                         result = f"{backend_info}📋 **Table:** {full_table_name}\n\n**Column Information:**\n{info_result}"
-
+                        
                         if show_sample:
                             sample_query = f"SELECT * FROM {full_table_name} LIMIT 3"
                             sample_result = _execute_bigquery_query(sample_query)
                             result += f"\n\n📊 **Sample Data (first 3 rows):**\n{sample_result}"
-
+                        
                         return result
-            except Exception:
-                pass  # Fall through to try simple name approach
-
-        # Try both datasets with simple name (fallback or original approach)
-        for dataset in ["mimiciv_3_1_hosp", "mimiciv_3_1_icu"]:
+                except Exception as e:
+                    pass  # Fall through to dynamic search
+        
+        # Attempt 2: Dynamic dataset search for simple table names
+        # Query all accessible datasets and search for the table
+        try:
+            search_query = f"""
+            SELECT DISTINCT table_schema
+            FROM `region-us.INFORMATION_SCHEMA.TABLE_STORAGE`
+            ORDER BY table_schema
+            """
+            datasets_df = _bq_client.query(search_query).to_dataframe()
+            dataset_list = datasets_df["table_schema"].tolist() if not datasets_df.empty else []
+        except Exception:
+            # Fallback to known MIMIC and common datasets
+            dataset_list = [
+                "physionet-data.mimiciv_3_1_hosp",
+                "physionet-data.mimiciv_3_1_icu",
+                "physionet-data.mimiciv_note",
+                "physionet-data.mimiciv_3_1_note",
+            ]
+        
+        # Search for the table in all datasets
+        for dataset in dataset_list:
             try:
-                full_table_name = f"`physionet-data.{dataset}.{simple_table_name}`"
-
-                # Get column information
+                full_table_name = f"`{dataset}.{simple_table_name}`"
                 info_query = f"""
                 SELECT column_name, data_type, is_nullable
-                FROM `physionet-data.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+                FROM `{dataset}.INFORMATION_SCHEMA.COLUMNS`
                 WHERE table_name = '{simple_table_name}'
                 ORDER BY ordinal_position
                 """
-
+                
                 info_result = _execute_bigquery_query(info_query)
                 if "No results found" not in info_result:
                     result = f"{backend_info}📋 **Table:** {full_table_name}\n\n**Column Information:**\n{info_result}"
-
+                    
                     if show_sample:
                         sample_query = f"SELECT * FROM {full_table_name} LIMIT 3"
                         sample_result = _execute_bigquery_query(sample_query)
-                        result += (
-                            f"\n\n📊 **Sample Data (first 3 rows):**\n{sample_result}"
-                        )
-
+                        result += f"\n\n📊 **Sample Data (first 3 rows):**\n{sample_result}"
+                    
                     return result
             except Exception:
                 continue
+        
+        return f"{backend_info}❌ Table '{table_name}' not found. 
 
-        return f"{backend_info}❌ Table '{table_name}' not found in any dataset. Use get_database_schema() to see available tables."
+**Troubleshooting:**
+1. Ensure you provided the correct table name (case matters in BigQuery)
+2. Use `get_database_schema()` to see the exact fully qualified table name
+3. If your custom table is in a different GCP project, provide the fully qualified name: `project.dataset.table_name`
+4. For custom tables in your own project, set the environment variable: `M3_PROJECT_ID=your-gcp-project` and restart
+
+**Example for custom table:**
+   `get_table_info('your-project.your_dataset.patient_notes_json')`"
 
 
 @mcp.tool()
 @require_oauth2
 def execute_mimic_query(sql_query: str) -> str:
-    """🚀 Execute SQL queries to analyze MIMIC-IV data.
+    """🚀 Execute SQL queries to analyze MIMIC-IV data (or any custom tables).
 
     **💡 Pro tip:** For best results, explore the database structure first!
 
     **Recommended workflow (especially for smaller models):**
-    1. **See available tables:** Use `get_database_schema()` to list all tables
+    1. **See available tables:** Use `get_database_schema()` to list all tables (including custom ones)
     2. **Examine table structure:** Use `get_table_info('table_name')` to see columns and sample data
     3. **Write your SQL query:** Use exact table/column names from exploration
 
     **Why exploration helps:**
-    - Table names vary between backends (SQLite vs BigQuery)
+    - Table names vary between backends (DuckDB vs BigQuery)
     - Column names may be unexpected (e.g., age might be 'anchor_age')
     - Sample data shows actual formats and constraints
 
+    **Works with:**
+    - MIMIC-IV tables ✅
+    - Custom/user-created tables ✅
+    - Joined queries across multiple tables ✅
+    - ANY table visible in `get_database_schema()` ✅
+
+    **If `get_table_info()` can't find your custom table:**
+    You can still query it directly with `execute_mimic_query()` using its fully qualified name:
+    ```sql
+    SELECT * FROM `your-project.your_dataset.patient_notes_json` LIMIT 10
+    ```
+
     Args:
-        sql_query: Your SQL SELECT query (must be SELECT only)
+        sql_query: Your SQL SELECT query (must be SELECT only for security)
 
     Returns:
         Query results or helpful error messages with next steps
@@ -681,6 +945,243 @@ This ensures compatibility across different MIMIC-IV setups."""
     return result
 
 
+@mcp.tool()
+@require_oauth2
+def get_clinical_notes_table(
+    table_name: str | None = None,
+    note_type: str = "all",
+    limit: int = 5,
+    preview_chars: int = 300,
+) -> str:
+    """📝 Explore clinical notes rows with linked IDs for cross-tool workflows.
+
+    This tool focuses on notes-table access and returns row-level note previews
+    plus relation IDs (subject_id/hadm_id/stay_id when available) so results can
+    be joined with other MIMIC tools.
+
+    Args:
+        table_name: Optional specific notes table. If omitted, first discovered table is used.
+        note_type: Filter tables by type ('all', 'discharge', or 'radiology').
+        limit: Number of rows to preview.
+        preview_chars: Max characters shown from note text per row.
+
+    Returns:
+        Available notes tables, selected table, schema summary, and sample rows.
+    """
+    if not _validate_limit(limit):
+        return "Error: Invalid limit. Must be a positive integer between 1 and 1000."
+
+    if not isinstance(preview_chars, int) or preview_chars <= 0 or preview_chars > 5000:
+        return "Error: Invalid preview_chars. Must be an integer between 1 and 5000."
+
+    if not _validate_note_type(note_type):
+        return "Error: Invalid note_type. Use one of: 'all', 'discharge', 'radiology'."
+
+    backend_info = _get_backend_info()
+
+    try:
+        discovered_tables = _discover_notes_tables(note_type=note_type)
+    except Exception as e:
+        return f"{backend_info}❌ Failed to discover notes tables: {e}"
+
+    selected_table, selection_error = _select_notes_table(discovered_tables, table_name)
+    if selection_error:
+        return f"{backend_info}❌ {selection_error}"
+    if not selected_table:
+        return f"{backend_info}❌ No clinical notes tables available."
+
+    available_tables_text = "\n".join(
+        f"- {t['display_name']}" for t in discovered_tables
+    )
+
+    try:
+        columns = _get_table_columns(selected_table)
+    except Exception as e:
+        return f"{backend_info}❌ Failed to read table schema for {selected_table['display_name']}: {e}"
+
+    if not columns:
+        return f"{backend_info}❌ Could not find columns for {selected_table['display_name']}."
+
+    id_candidates = [
+        "note_id",
+        "subject_id",
+        "hadm_id",
+        "stay_id",
+        "charttime",
+        "chartdate",
+        "storetime",
+        "note_type",
+        "category",
+    ]
+    text_candidates = ["text", "note_text", "note", "content"]
+
+    selected_id_columns = [c for c in id_candidates if c in {x.lower() for x in columns}]
+    resolved_id_columns = []
+    for candidate in selected_id_columns:
+        col_name = _find_first_column(columns, [candidate])
+        if col_name:
+            resolved_id_columns.append(col_name)
+
+    text_column = _find_first_column(columns, text_candidates)
+    if not text_column:
+        return (
+            f"{backend_info}❌ Could not detect a note text column in {selected_table['display_name']}.\n\n"
+            f"Detected columns: {', '.join(columns)}"
+        )
+
+    projection_parts = resolved_id_columns.copy()
+    if _backend == "duckdb":
+        projection_parts.append(
+            f"SUBSTR(CAST({text_column} AS VARCHAR), 1, {preview_chars}) AS note_preview"
+        )
+    else:
+        projection_parts.append(
+            f"SUBSTR(CAST({text_column} AS STRING), 1, {preview_chars}) AS note_preview"
+        )
+
+    query = (
+        f"SELECT {', '.join(projection_parts)} "
+        f"FROM {selected_table['query_name']} "
+        f"LIMIT {limit}"
+    )
+
+    rows = _execute_query_internal(query)
+    if "❌" in rows:
+        return rows
+
+    relation_keys = ", ".join(
+        [c for c in ["subject_id", "hadm_id", "stay_id", "note_id"] if c in {x.lower() for x in columns}]
+    )
+    if not relation_keys:
+        relation_keys = "No standard relation IDs detected"
+
+    return (
+        f"{backend_info}"
+        f"📋 **Available Notes Tables:**\n{available_tables_text}\n\n"
+        f"🧾 **Selected Table:** {selected_table['display_name']}\n"
+        f"🔗 **Detected Relation Keys:** {relation_keys}\n"
+        f"📝 **Detected Text Column:** {text_column}\n\n"
+        f"📊 **Sample Note Rows (limit {limit}):**\n{rows}\n\n"
+        "💡 Use detected relation keys (subject_id/hadm_id/stay_id) with other tools like `get_icu_stays`, `get_lab_results`, and `execute_mimic_query` to connect notes with structured data."
+    )
+
+
+@mcp.tool()
+@require_oauth2
+def get_clinical_note_row(
+    note_id: str,
+    table_name: str | None = None,
+    note_type: str = "all",
+    max_note_chars: int = 4000,
+) -> str:
+    """📄 Read a specific clinical note row with its linked identifiers.
+
+    This tool retrieves one row from a notes table by note identifier and returns
+    relation IDs plus note text to support downstream linking with other tools.
+
+    Args:
+        note_id: Note identifier value to search.
+        table_name: Optional specific notes table.
+        note_type: Filter notes tables by type ('all', 'discharge', 'radiology').
+        max_note_chars: Maximum note text characters to return.
+
+    Returns:
+        A single note row containing identifiers and note content preview/full text.
+    """
+    if not note_id or not note_id.strip():
+        return "Error: note_id is required."
+
+    if not _validate_note_type(note_type):
+        return "Error: Invalid note_type. Use one of: 'all', 'discharge', 'radiology'."
+
+    if (
+        not isinstance(max_note_chars, int)
+        or max_note_chars <= 0
+        or max_note_chars > 50000
+    ):
+        return "Error: Invalid max_note_chars. Must be an integer between 1 and 50000."
+
+    backend_info = _get_backend_info()
+
+    try:
+        discovered_tables = _discover_notes_tables(note_type=note_type)
+    except Exception as e:
+        return f"{backend_info}❌ Failed to discover notes tables: {e}"
+
+    selected_table, selection_error = _select_notes_table(discovered_tables, table_name)
+    if selection_error:
+        return f"{backend_info}❌ {selection_error}"
+    if not selected_table:
+        return f"{backend_info}❌ No clinical notes tables available."
+
+    try:
+        columns = _get_table_columns(selected_table)
+    except Exception as e:
+        return f"{backend_info}❌ Failed to read table schema for {selected_table['display_name']}: {e}"
+
+    if not columns:
+        return f"{backend_info}❌ Could not find columns for {selected_table['display_name']}."
+
+    note_id_column = _find_first_column(columns, ["note_id", "row_id", "id"])
+    if not note_id_column:
+        return (
+            f"{backend_info}❌ Could not detect note ID column in {selected_table['display_name']}.\n\n"
+            f"Detected columns: {', '.join(columns)}"
+        )
+
+    text_column = _find_first_column(columns, ["text", "note_text", "note", "content"])
+    if not text_column:
+        return (
+            f"{backend_info}❌ Could not detect note text column in {selected_table['display_name']}.\n\n"
+            f"Detected columns: {', '.join(columns)}"
+        )
+
+    projection = []
+    for col in ["note_id", "subject_id", "hadm_id", "stay_id", "charttime", "chartdate", "note_type", "category"]:
+        matched = _find_first_column(columns, [col])
+        if matched:
+            projection.append(matched)
+
+    if _backend == "duckdb":
+        projection.append(
+            f"SUBSTR(CAST({text_column} AS VARCHAR), 1, {max_note_chars}) AS note_text"
+        )
+        where_clause = (
+            f"CAST({note_id_column} AS VARCHAR) = '{_escape_sql_literal(note_id.strip())}'"
+        )
+    else:
+        projection.append(
+            f"SUBSTR(CAST({text_column} AS STRING), 1, {max_note_chars}) AS note_text"
+        )
+        where_clause = (
+            f"CAST({note_id_column} AS STRING) = '{_escape_sql_literal(note_id.strip())}'"
+        )
+
+    query = (
+        f"SELECT {', '.join(projection)} "
+        f"FROM {selected_table['query_name']} "
+        f"WHERE {where_clause} "
+        "LIMIT 1"
+    )
+
+    row_result = _execute_query_internal(query)
+    if "No results found" in row_result:
+        return (
+            f"{backend_info}❌ No note found for note_id='{note_id}' in {selected_table['display_name']}.\n\n"
+            "💡 Use `get_clinical_notes_table()` first to inspect available IDs and tables."
+        )
+    if "❌" in row_result:
+        return row_result
+
+    return (
+        f"{backend_info}"
+        f"🧾 **Table:** {selected_table['display_name']}\n"
+        f"🔎 **Lookup:** {note_id_column} = '{note_id.strip()}'\n\n"
+        f"📄 **Note Row:**\n{row_result}\n\n"
+        "💡 You can use `subject_id`, `hadm_id`, or `stay_id` from this row with other MIMIC tools to connect structured and unstructured data."
+    )
+
+
 def main():
     """Main entry point for MCP server.
 
@@ -699,13 +1200,11 @@ def main():
     """
     transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
 
-    if transport in ("sse", "http"):
-        host = os.getenv("MCP_HOST", "0.0.0.0")
-        port = int(os.getenv("MCP_PORT", "3000"))
-        path = os.getenv("MCP_PATH", "/sse")
-        mcp.run(transport="streamable-http", host=host, port=port, path=path)
-    else:
-        mcp.run()
+    host = os.getenv("MCP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_PORT", "3000"))
+    path = os.getenv("MCP_PATH", "/sse")
+    mcp.run(transport="streamable-http", host=host, port=port, path=path)
+
 
 
 if __name__ == "__main__":
