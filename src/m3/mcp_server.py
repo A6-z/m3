@@ -648,9 +648,6 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
         pragma_query = f"PRAGMA table_info({qualified_name})"
         try:
             result = _execute_duckdb_query(pragma_query)
-            if "error" in result.lower():
-                return f"{backend_info}❌ Table '{table_name}' not found. Use get_database_schema() to see available tables."
-
             shown_name = (
                 f"{schema_name}.{plain_table_name}" if schema_name else plain_table_name
             )
@@ -745,19 +742,7 @@ def get_table_info(table_name: str, show_sample: bool = True) -> str:
                     return result
             except Exception:
                 continue
-        
-        return f"{backend_info}❌ Table '{table_name}' not found. 
-
-**Troubleshooting:**
-1. Ensure you provided the correct table name (case matters in BigQuery)
-2. Use `get_database_schema()` to see the exact fully qualified table name
-3. If your custom table is in a different GCP project, provide the fully qualified name: `project.dataset.table_name`
-4. For custom tables in your own project, set the environment variable: `M3_PROJECT_ID=your-gcp-project` and restart
-
-**Example for custom table:**
-   `get_table_info('your-project.your_dataset.patient_notes_json')`"
-
-
+            
 @mcp.tool()
 @require_oauth2
 def execute_mimic_query(sql_query: str) -> str:
